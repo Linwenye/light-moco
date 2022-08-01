@@ -1,6 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import torch
 import torch.nn as nn
+from itertools import combinations
 
 
 class MoCo(nn.Module):
@@ -8,7 +9,8 @@ class MoCo(nn.Module):
     Build a MoCo model with: a query encoder, a key encoder, and a queue
     https://arxiv.org/abs/1911.05722
     """
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
+
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, symmetric=False, split_view=False, combs=3):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -20,7 +22,9 @@ class MoCo(nn.Module):
         self.K = K
         self.m = m
         self.T = T
-
+        self.symmetric = symmetric
+        self.split_view = split_view
+        self.combs = combs  # combs=3 for 4 views; combs=2 for 6 views
         # create the encoders
         # num_classes is the output fc dimension
         self.encoder_q = base_encoder(num_classes=dim)
@@ -112,28 +116,27 @@ class MoCo(nn.Module):
 
         return x_gather[idx_this]
 
-    def forward(self, im_q, im_k):
-        """
-        Input:
-            im_q: a batch of query images
-            im_k: a batch of key images
-        Output:
-            logits, targets
-        """
+    def _local_split(self, x):  # NxCxHxW --> 4NxCx(H/2)x(W/2)
+        _side_indent = x.size(2) // self.split_num, x.size(3) // self.split_num
+        cols = x.split(_side_indent[1], dim=3)
+        xs = []
+        for _x in cols:
+            xs += _x.split(_side_indent[0], dim=2)
+        x = torch.cat(xs, dim=0)
+        return x
 
+    def contrastive_loss(self, im_q, im_k):
         # compute query features
         q = self.encoder_q(im_q)  # queries: NxC
-        q = nn.functional.normalize(q, dim=1)
+        q = nn.functional.normalize(q, dim=1)  # already normalized
 
         # compute key features
         with torch.no_grad():  # no gradient to keys
-            self._momentum_update_key_encoder()  # update the key encoder
-
             # shuffle for making use of BN
-            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+            im_k_, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.encoder_k(im_k)  # keys: NxC
-            k = nn.functional.normalize(k, dim=1)
+            k = self.encoder_k(im_k_)  # keys: NxC
+            k = nn.functional.normalize(k, dim=1)  # already normalized
 
             # undo shuffle
             k = self._batch_unshuffle_ddp(k, idx_unshuffle)
@@ -154,10 +157,54 @@ class MoCo(nn.Module):
         # labels: positive key indicators
         labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
 
-        # dequeue and enqueue
+        loss = nn.CrossEntropyLoss().cuda()(logits, labels)
+
+        return loss, q, k
+
+    def split_contrastive_loss(self, im_q, im_k):
+
+        im_q_splits = self._local_split(im_q)
+        im_q_splits = self.encoder_q(im_q_splits)
+        im_q_splits = list(im_q_splits.split(im_q_splits.size(0) // 4, dim=0))  # 4b x c x
+        im_q_orthmix = list(map(lambda x: sum(x) / self.combs, list(combinations(im_q_splits, r=self.combs))))  # 6 of 2combs / 4 of 3combs
+
+        with torch.no_grad():
+            im_k_, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+
+            k = self.encoder_k(im_k_)  # keys: NxC
+            k = nn.functional.normalize(k, dim=1)  # already normalized
+
+            # undo shuffle
+            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+
+    def forward(self, im1, im2):
+        """
+        Input:
+            im_q: a batch of query images
+            im_k: a batch of key images
+        Output:
+            loss
+        """
+
+        # update the key encoder
+        with torch.no_grad():  # no gradient to keys
+            self._momentum_update_key_encoder()
+
+        # compute loss
+        if self.split_view:
+            im2_splits = self._local_split(im2)
+        else:
+            if self.symmetric:  # asymmetric loss
+                loss_12, q1, k2 = self.contrastive_loss(im1, im2)
+                loss_21, q2, k1 = self.contrastive_loss(im2, im1)
+                loss = loss_12 + loss_21
+                k = torch.cat([k1, k2], dim=0)
+            else:  # asymmetric loss
+                loss, q, k = self.contrastive_loss(im1, im2)
+
         self._dequeue_and_enqueue(k)
 
-        return logits, labels
+        return loss
 
 
 # utils
@@ -168,7 +215,7 @@ def concat_all_gather(tensor):
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
     tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
+                      for _ in range(torch.distributed.get_world_size())]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
     output = torch.cat(tensors_gather, dim=0)
