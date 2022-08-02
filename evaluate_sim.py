@@ -27,6 +27,7 @@ import moco.builder
 from tqdm import tqdm
 
 import torch.nn.functional as F
+from knn_imagenet import kNN
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -40,7 +41,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     help='model architecture: ' +
                          ' | '.join(model_names) +
                          ' (default: resnet50)')
-parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -232,10 +233,11 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ToTensor(),
             normalize,
         ]))
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=False)
+        num_workers=args.workers, pin_memory=True, drop_last=True, sampler=train_sampler)
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
             transforms.Resize(256),
@@ -244,13 +246,14 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ])),
         batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=False)
-    if args.gpu == 0:
-        eval_sim(val_loader, model, criterion, optimizer, args)
-        print()
-        print('train_loader')
-        print('--------------------')
-        eval_sim(train_loader, model, criterion, optimizer, args)
+        num_workers=args.workers, pin_memory=True)
+    # if args.gpu == 0:
+    # eval_sim(val_loader, model, criterion, optimizer, args)
+    print()
+    print('train_loader')
+    print('--------------------')
+    kNN(model, train_loader, val_loader, 20, args.moco_t)
+    # eval_sim(train_loader, model, criterion, optimizer, args)
     dist.destroy_process_group()
 
 
@@ -266,8 +269,6 @@ def eval_sim(train_loader, model, criterion, optimizer, args):
             # labels_bank.append(labels.cuda(non_blocking=False))
             labels_bank.append(labels)
 
-        # if i > 10:
-        #     break
     feature_bank = torch.cat(feature_bank, dim=0)
     labels_bank = torch.cat(labels_bank, dim=0)
     sim_matrix = feature_bank @ feature_bank.T
@@ -292,23 +293,6 @@ def eval_sim(train_loader, model, criterion, optimizer, args):
         # print('avg sim with diag', label_specific_sim.mean())
         n = label_specific_sim.shape[0]
         print('avg sim without diag', label_specific_sim.flatten()[:-1].view(n - 1, n + 1)[:, 1:].mean())
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
 
 
 if __name__ == '__main__':

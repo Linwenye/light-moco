@@ -25,6 +25,7 @@ class MoCo(nn.Module):
         self.symmetric = symmetric
         self.split_view = split_view
         self.combs = combs  # combs=3 for 4 views; combs=2 for 6 views
+        self.split_num = 2
         # create the encoders
         # num_classes is the output fc dimension
         self.encoder_q = base_encoder(num_classes=dim)
@@ -32,13 +33,18 @@ class MoCo(nn.Module):
 
         if mlp:  # hack: brute-force replacement
             dim_mlp = self.encoder_q.fc.weight.shape[1]
+            # self.encoder_q_fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
+            # self.encoder_k_fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
+            # self.encoder_q.fc = nn.Identity()
+            # self.encoder_k.fc = nn.Identity()
             self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
             self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
-
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
-
+        # for param_q, param_k in zip(self.encoder_q_fc.parameters(), self.encoder_k_fc.parameters()):
+        #     param_k.data.copy_(param_q.data)  # initialize
+        #     param_k.requires_grad = False  # not update by gradient
         # create the queue
         self.register_buffer("queue", torch.randn(dim, K))
         self.queue = nn.functional.normalize(self.queue, dim=0)
@@ -52,6 +58,8 @@ class MoCo(nn.Module):
         """
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+        # for param_q, param_k in zip(self.encoder_q_fc.parameters(), self.encoder_k_fc.parameters()):
+        #     param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
@@ -127,7 +135,7 @@ class MoCo(nn.Module):
 
     def contrastive_loss(self, im_q, im_k):
         # compute query features
-        q = self.encoder_q(im_q)  # queries: NxC
+        q = self.encoder_q_fc(self.encoder_q(im_q))  # queries: NxC
         q = nn.functional.normalize(q, dim=1)  # already normalized
 
         # compute key features
@@ -135,7 +143,7 @@ class MoCo(nn.Module):
             # shuffle for making use of BN
             im_k_, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.encoder_k(im_k_)  # keys: NxC
+            k = self.encoder_k_fc(self.encoder_k(im_k_))  # keys: NxC
             k = nn.functional.normalize(k, dim=1)  # already normalized
 
             # undo shuffle
@@ -166,18 +174,42 @@ class MoCo(nn.Module):
         im_q_splits = self._local_split(im_q)
         im_q_splits = self.encoder_q(im_q_splits)
         im_q_splits = list(im_q_splits.split(im_q_splits.size(0) // 4, dim=0))  # 4b x c x
-        im_q_orthmix = list(map(lambda x: sum(x) / self.combs, list(combinations(im_q_splits, r=self.combs))))  # 6 of 2combs / 4 of 3combs
+        im_q_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(im_q_splits, r=self.combs)))),
+                                 dim=0)  # 6 of 2combs / 4 of 3combs
+        q = self.encoder_q_fc(im_q_orthmix)
+        assert len(q.shape) == 2
+        q = nn.functional.normalize(q, dim=1)
 
         with torch.no_grad():
             im_k_, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.encoder_k(im_k_)  # keys: NxC
+            k = self.encoder_k_fc(self.encoder_k(im_k_))  # keys: NxC
             k = nn.functional.normalize(k, dim=1)  # already normalized
 
             # undo shuffle
             k = self._batch_unshuffle_ddp(k, idx_unshuffle)
 
-    def forward(self, im1, im2):
+        # positive logits: 4Nx1
+        qs = q.split(k.size(0), dim=0)
+        loss = 0
+        for q in qs:
+            l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+            # negative logits: NxK
+            l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+
+            # logits: Nx(1+K)
+            logits = torch.cat([l_pos, l_neg], dim=1)
+
+            # apply temperature
+            logits /= self.T
+
+            # labels: positive key indicators
+            labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+            loss += nn.CrossEntropyLoss().cuda()(logits, labels)
+
+        return loss / len(qs), q, k
+
+    def forward(self, im1, im2=None):
         """
         Input:
             im_q: a batch of query images
@@ -185,14 +217,21 @@ class MoCo(nn.Module):
         Output:
             loss
         """
-
+        if im2 is None:
+            return nn.functional.normalize(self.encoder_q(im1), dim=-1)
         # update the key encoder
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()
 
         # compute loss
         if self.split_view:
-            im2_splits = self._local_split(im2)
+            if self.symmetric:
+                loss_12, q1, k2 = self.split_contrastive_loss(im1, im2)
+                loss_21, q2, k1 = self.split_contrastive_loss(im2, im1)
+                loss = loss_12 + loss_21
+                k = torch.cat([k1, k2], dim=0)
+            else:
+                loss, q, k = self.split_contrastive_loss(im1, im2)
         else:
             if self.symmetric:  # asymmetric loss
                 loss_12, q1, k2 = self.contrastive_loss(im1, im2)
