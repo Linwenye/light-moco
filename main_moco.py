@@ -25,9 +25,16 @@ import torchvision.models as models
 import moco.loader
 import moco.builder
 from moco.utils import *
+from my_models import mobilenetv3
+from my_models.efficientnet import efficientnet_b0, efficientnet_b1
+
 model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
+                     if name.islower() and not name.startswith("__")
+                     and callable(models.__dict__[name]))
+
+model_names.append('mobilenetv3')  ##  add_0
+model_names.append("efficientb0")
+model_names.append("efficientb1")
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
@@ -35,8 +42,8 @@ parser.add_argument('data', metavar='DIR',
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet50)')
+                         ' | '.join(model_names) +
+                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
@@ -100,6 +107,11 @@ parser.add_argument('--cos', action='store_true',
 parser.add_argument('--symmetric', action='store_true')
 parser.add_argument('--split-view', action='store_true')
 parser.add_argument('--nn-pos', type=int, default=0)
+parser.add_argument('--warm', type=int, default=0)
+parser.add_argument('--smooth', type=float, default=0)
+parser.add_argument('--momen-cos', action='store_true')
+parser.add_argument('--strategy', type=int, default=1)
+
 
 def main():
     args = parser.parse_args()
@@ -144,6 +156,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.multiprocessing_distributed and args.gpu != 0:
         def print_pass(*args):
             pass
+
         builtins.print = print_pass
 
     if args.gpu is not None:
@@ -160,11 +173,27 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp,args.symmetric,args.split_view)
-    print(model)
+    zero_init = False
+    if args.arch == 'mobilenetv3':
+        print("=> MobileV3: creating model '{}'".format(args.arch))
+        base_model = mobilenetv3.mobilenetv3_large_100
+    elif args.arch in "efficientb0":
+        print("=> Effib0: creating model '{}'".format(args.arch))
+        base_model = efficientnet_b0
+    elif args.arch in "efficientb1":
+        print("=> Effib0: creating model '{}'".format(args.arch))
+        base_model = efficientnet_b1
 
+    else:
+        print("=> ELSE: creating model '{}'".format(args.arch))
+        base_model = models.__dict__[args.arch]
+        zero_init = True
+    model = moco.builder.MoCo(
+        base_model,
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp, args.symmetric, args.split_view, args.smooth, args.nn_pos,
+        strategy=args.strategy, zero_init=zero_init)
+    print(model)
+    print(args)
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
@@ -265,18 +294,24 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
-
+        if args.momen_cos:
+            moco_m = adjust_moco_momentum(epoch, args)
+            model.m = moco_m
         # train for one epoch
+        if epoch < args.warm:
+            model.module.smooth = 0
+        else:
+            model.module.smooth = args.smooth
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+                                                    and args.rank % ngpus_per_node == 0):
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename=args.output_dir+'/checkpoint_{:04d}.pth.tar'.format(epoch))
+                'optimizer': optimizer.state_dict(),
+            }, is_best=False, filename=args.output_dir + '/checkpoint_{:04d}.pth.tar'.format(epoch))
     dist.destroy_process_group()
 
 

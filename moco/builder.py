@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from itertools import combinations
+from moco.utils import softmax_cross_entropy_with_softtarget
 
 
 class MoCo(nn.Module):
@@ -10,7 +11,8 @@ class MoCo(nn.Module):
     https://arxiv.org/abs/1911.05722
     """
 
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, symmetric=False, split_view=False, combs=3):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, symmetric=False, split_view=False, smooth=0, nn_pos=0,
+                 inner_dim=2048, strategy=1, zero_init=True):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -24,21 +26,27 @@ class MoCo(nn.Module):
         self.T = T
         self.symmetric = symmetric
         self.split_view = split_view
-        self.combs = combs  # combs=3 for 4 views; combs=2 for 6 views
+        self.combs = 3  # combs=3 for 4 views; combs=2 for 6 views
         self.split_num = 2
+        self.smooth = smooth
+        self.nn_pos = nn_pos
+        self.strategy = strategy
         # create the encoders
         # num_classes is the output fc dimension
-        self.encoder_q = base_encoder(num_classes=dim)
-        self.encoder_k = base_encoder(num_classes=dim)
-
+        if zero_init:
+            self.encoder_q = base_encoder(num_classes=dim, zero_init_residual=True)
+            self.encoder_k = base_encoder(num_classes=dim, zero_init_residual=True)
+        else:
+            self.encoder_q = base_encoder(num_classes=dim)
+            self.encoder_k = base_encoder(num_classes=dim)
         if mlp:  # hack: brute-force replacement
             dim_mlp = self.encoder_q.fc.weight.shape[1]
-            # self.encoder_q_fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
-            # self.encoder_k_fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
+            # self.encoder_q_fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), self.encoder_q.fc)
+            # self.encoder_k_fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), self.encoder_k.fc)
             # self.encoder_q.fc = nn.Identity()
             # self.encoder_k.fc = nn.Identity()
-            self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
-            self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
+            self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
+            self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
@@ -135,7 +143,8 @@ class MoCo(nn.Module):
 
     def contrastive_loss(self, im_q, im_k):
         # compute query features
-        q = self.encoder_q_fc(self.encoder_q(im_q))  # queries: NxC
+        # q = self.encoder_q_fc(self.encoder_q(im_q))  # queries: NxC
+        q = self.encoder_q(im_q)  # queries: NxC
         q = nn.functional.normalize(q, dim=1)  # already normalized
 
         # compute key features
@@ -143,7 +152,8 @@ class MoCo(nn.Module):
             # shuffle for making use of BN
             im_k_, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.encoder_k_fc(self.encoder_k(im_k_))  # keys: NxC
+            # k = self.encoder_k_fc(self.encoder_k(im_k_))  # keys: NxC
+            k = self.encoder_k(im_k_)  # keys: NxC
             k = nn.functional.normalize(k, dim=1)  # already normalized
 
             # undo shuffle
@@ -162,11 +172,50 @@ class MoCo(nn.Module):
         # apply temperature
         logits /= self.T
 
-        # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        # labels: positive key indicators, (N,)
 
-        loss = nn.CrossEntropyLoss().cuda()(logits, labels)
+        if self.smooth == 0:
+            labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+            loss = nn.CrossEntropyLoss().cuda()(logits, labels)
+        else:
+            labels_prob = torch.zeros_like(logits).cuda()
+            if self.strategy == 1:
+                v, t = l_neg.topk(self.nn_pos)
+                labels_prob[:, 0] = 1 - self.smooth
+                labels_prob.scatter_(1, t + 1, self.smooth / self.nn_pos)
+            elif self.strategy == 2:
+                v, t = l_neg.topk(21)
+                labels_prob[:, 0] = 1 - self.smooth
+                splits = [0, 2, 8, 20]
+                every_splits = [self.smooth / 2, self.smooth / 4, self.smooth / 4]
+                for i in range(1, 4):
+                    item_smooth = every_splits[i - 1] / (splits[i] - splits[i - 1])
+                    labels_prob.scatter_(1, t[:, splits[i - 1]:splits[i]] + 1, item_smooth)
+            elif self.strategy == 3:
+                v, t = l_neg.topk(11)
+                labels_prob[:, 0] = 0.6
+                for i in range(10):
+                    labels_prob[torch.arange(labels_prob.size(0)), t[:, i] + 1] = 0.2 / (2 ** i)
+                labels_prob[torch.arange(labels_prob.size(0)), t[:, 10] + 1] = 0.2 / (2 ** 9)
 
+            elif self.strategy == 4:
+                v, t = l_neg.topk(2)
+                labels_prob[:, 0] = 0.5
+                labels_prob[torch.arange(labels_prob.size(0)), t[:, 0] + 1] = 0.5
+            elif self.strategy == 5:
+                labels_prob.add_(self.smooth / (labels_prob.size(1) - 1))
+                labels_prob[:, 0] = 1 - self.smooth
+            elif self.strategy == 6:
+                v, t = l_neg.topk(21)
+                labels_prob[:, 0] = 1 - self.smooth
+                splits = [0, 2, 8, 20]
+                every_splits = self.smooth / 3
+                for i in range(1, 4):
+                    item_smooth = every_splits / (splits[i] - splits[i - 1])
+                    labels_prob.scatter_(1, t[:, splits[i - 1]:splits[i]] + 1, item_smooth)
+            loss = softmax_cross_entropy_with_softtarget(logits, labels_prob)
+            # loss = nn.KLDivLoss().cuda()(nn.LogSoftmax().cuda()(logits), labels_prob)
+            # loss = nn.CrossEntropyLoss().cuda()(logits, labels_prob)
         return loss, q, k
 
     def split_contrastive_loss(self, im_q, im_k):
@@ -234,6 +283,7 @@ class MoCo(nn.Module):
                 loss, q, k = self.split_contrastive_loss(im1, im2)
         else:
             if self.symmetric:  # asymmetric loss
+
                 loss_12, q1, k2 = self.contrastive_loss(im1, im2)
                 loss_21, q2, k1 = self.contrastive_loss(im2, im1)
                 loss = loss_12 + loss_21

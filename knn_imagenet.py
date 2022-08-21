@@ -10,7 +10,7 @@ def kNN(net, trainloader, testloader, K, sigma):
     cls_time = AverageMeter('cls_time')
     total = 0
     testsize = testloader.dataset.__len__()
-    dim = 128
+    dim = 512
     trainFeatures = torch.empty(trainloader.dataset.__len__(), dim).t().cuda()
 
     transform_bak = trainloader.dataset.transform
@@ -18,7 +18,7 @@ def kNN(net, trainloader, testloader, K, sigma):
     # temploader = torch.utils.data.DataLoader(trainloader.dataset, batch_size=512, shuffle=False, num_workers=16)
     labels = []
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in tqdm(enumerate(trainloader)):
+        for batch_idx, (inputs, targets) in tqdm(enumerate(trainloader), desc='loading features', total=len(trainloader)):
             labels.append(concat_all_gather(targets.cuda(non_blocking=True)))
             batchSize = 512
             features = net(inputs)

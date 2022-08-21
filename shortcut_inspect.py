@@ -21,8 +21,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-from my_models import mobilenetv3
-from my_models.efficientnet import efficientnet_b0, efficientnet_b1
+
 import moco.loader
 import moco.builder
 from tqdm import tqdm
@@ -34,25 +33,21 @@ model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
-model_names.append('mobilenetv3')  ##  add_0
-model_names.append("efficientb0")
-model_names.append("efficientb1")
-
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
+parser.add_argument('--data', default='/apdcephfs/share_916081/liniuslin/Collapse/datasets/picked/',
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
                          ' | '.join(model_names) +
                          ' (default: resnet50)')
-parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=10, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -180,8 +175,6 @@ def main_worker(gpu, ngpus_per_node, args):
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
@@ -199,7 +192,6 @@ def main_worker(gpu, ngpus_per_node, args):
         raise NotImplementedError("Only DistributedDataParallel is supported.")
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -226,25 +218,33 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    view_pos = os.path.join(args.data, 'pos')
+    view_neg = os.path.join(args.data, 'neg')
+    view_pos_other = os.path.join(args.data, 'pos_others')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+    pos_dataset = datasets.ImageFolder(
+        view_pos, transforms.Compose([
             transforms.ToTensor(),
             normalize,
         ]))
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    print('classes', pos_dataset.classes)
+    print('idx', pos_dataset.class_to_idx)
+    pos_loader = torch.utils.data.DataLoader(
+        pos_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, drop_last=True, sampler=train_sampler)
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
+    neg_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(view_neg, transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ])),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+
+    pos_other_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(view_pos_other, transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
@@ -252,53 +252,65 @@ def main_worker(gpu, ngpus_per_node, args):
         ])),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
-    # if args.gpu == 0:
-    # eval_sim(val_loader, model, criterion, optimizer, args)
-    print()
-    print('train_loader')
-    print('--------------------')
-    model.module.encoder_q.fc = nn.Identity()
-    kNN(model, train_loader, val_loader, 20, args.moco_t)
-    # eval_sim(train_loader, model, criterion, optimizer, args)
+
+    if args.gpu == 0:
+        eval_sim(pos_loader, neg_loader, pos_other_loader, model, args)
     dist.destroy_process_group()
 
 
-def eval_sim(train_loader, model, criterion, optimizer, args):
+def eval_sim(pos_loader, neg_loader, pos_other_loader, model, args):
     # switch to train mode
     model.eval()
-    feature_bank, labels_bank = [], []
+    feature_pos_bank, feature_neg_bank, feature_pos_others, labels_bank = [], [], [], []
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(train_loader)):
-            feature = model(images.cuda(non_blocking=False))
-            feature_bank.append(F.normalize(feature, dim=-1).cpu())
-            # feature_bank.append(F.normalize(feature, dim=-1))
-            # labels_bank.append(labels.cuda(non_blocking=False))
-            labels_bank.append(labels)
-
-    feature_bank = torch.cat(feature_bank, dim=0)
+        for i, ((images_pos, labels1), (images_neg, labels2), (images_pos_other, _)) in tqdm(
+                enumerate(zip(pos_loader, neg_loader, pos_other_loader))):
+            feature_pos = model(images_pos.cuda(non_blocking=False))
+            feature_neg = model(images_neg.cuda(non_blocking=False))
+            feature_pos_other = model(images_pos_other.cuda(non_blocking=False))
+            feature_pos_bank.append(F.normalize(feature_pos, dim=-1))
+            feature_neg_bank.append(F.normalize(feature_neg, dim=-1))
+            feature_pos_others.append(F.normalize(feature_pos_other, dim=-1))
+            labels_bank.append(labels1.cuda(non_blocking=False))
+    feature_pos_bank = torch.cat(feature_pos_bank, dim=0)
+    feature_neg_bank = torch.cat(feature_neg_bank, dim=0)
+    feature_pos_others = torch.cat(feature_pos_others, dim=0)
     labels_bank = torch.cat(labels_bank, dim=0)
-    sim_matrix = feature_bank @ feature_bank.T
+    sim_matrix = feature_pos_bank @ feature_pos_bank.T
+    pos_neg = (feature_pos_bank * feature_neg_bank).sum(-1)
+    sim_matrix_other = feature_pos_bank @ feature_pos_other.T
     n = sim_matrix.shape[0]
     print('total {} images'.format(n))
-    # print('avg with diag', sim_matrix.mean())
     print('avg without diag', sim_matrix.flatten()[:-1].view(n - 1, n + 1)[:, 1:].mean())
-
     labels_list = labels_bank.tolist()
     # print('label_list', labels_list)
     labels_set = set(labels_list)
     print('label_set', labels_set)
     print('labels num: ', len(labels_set))
+    label_specific_total_avg = 0
+    sim_matrix_other_total_avg = 0
     for label in labels_set:
         label_index = (labels_bank == label).nonzero(as_tuple=False).squeeze()
 
         print('label_index', label_index)
         label_specific_sim = sim_matrix[label_index][:, label_index]
+        sim_matrix_other_label = sim_matrix_other[label_index][:, label_index]
         # print('label_specific_sim',label_specific_sim)
         print('spec shape', label_specific_sim.shape)
         print('label', label)
         # print('avg sim with diag', label_specific_sim.mean())
         n = label_specific_sim.shape[0]
-        print('avg sim without diag', label_specific_sim.flatten()[:-1].view(n - 1, n + 1)[:, 1:].mean())
+        label_specific_sim_avg = label_specific_sim.flatten()[:-1].view(n - 1, n + 1)[:, 1:].mean()
+        sim_matrix_other_label_avg = sim_matrix_other_label.flatten()[:-1].view(n - 1, n + 1)[:, 1:].mean()
+        label_specific_total_avg += label_specific_sim_avg
+        sim_matrix_other_total_avg += sim_matrix_other_label_avg
+        print('avg sim without diag', label_specific_sim_avg)
+        print('label_sim', label_specific_sim)
+        print('pos_neg sim', pos_neg[label_index])
+    print('-------------')
+    print('label_specific_total_avg', label_specific_total_avg / 10)
+    print('other_total_avg', sim_matrix_other_total_avg / 10)
+    print('pos_neg avg', pos_neg.mean())
 
 
 if __name__ == '__main__':

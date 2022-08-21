@@ -1,4 +1,61 @@
 import torch
+import math
+import torch.nn.functional as F
+
+
+
+def softmax_cross_entropy_with_softtarget(input, target, reduction='mean'):
+    """
+    :param input: (batch, *)
+    :param target: (batch, *) same shape as input, each item must be a valid distribution: target[i, :].sum() == 1.
+    """
+    logprobs = torch.nn.functional.log_softmax(input.view(input.shape[0], -1), dim=1)
+    batchloss = - torch.sum(target.view(target.shape[0], -1) * logprobs, dim=1)
+    if reduction == 'none':
+        return batchloss
+    elif reduction == 'mean':
+        return torch.mean(batchloss)
+    elif reduction == 'sum':
+        return torch.sum(batchloss)
+    else:
+        raise NotImplementedError('Unsupported reduction mode.')
+
+
+class LARS(torch.optim.Optimizer):
+    """
+    LARS optimizer, no rate scaling or weight decay for parameters <= 1D.
+    """
+
+    def __init__(self, params, lr=0.0, weight_decay=0, momentum=0.9, trust_coefficient=0.001):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, trust_coefficient=trust_coefficient)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            for p in g['params']:
+                dp = p.grad
+
+                if dp is None:
+                    continue
+
+                if p.ndim > 1:  # if not normalization gamma/beta or bias
+                    dp = dp.add(p, alpha=g['weight_decay'])
+                    param_norm = torch.norm(p)
+                    update_norm = torch.norm(dp)
+                    one = torch.ones_like(param_norm)
+                    q = torch.where(param_norm > 0.,
+                                    torch.where(update_norm > 0,
+                                                (g['trust_coefficient'] * param_norm / update_norm), one),
+                                    one)
+                    dp = dp.mul(q)
+
+                param_state = self.state[p]
+                if 'mu' not in param_state:
+                    param_state['mu'] = torch.zeros_like(p)
+                mu = param_state['mu']
+                mu.mul_(g['momentum']).add_(dp)
+                p.add_(mu, alpha=-g['lr'])
 
 
 class AverageMeter(object):
@@ -47,12 +104,20 @@ def adjust_learning_rate(optimizer, epoch, args):
     """Decay the learning rate based on schedule"""
     lr = args.lr
     if args.cos:  # cosine lr schedule
-        lr *= 0.5 * (1. + math.cos(math.pi * epoch / args.epochs))
+        if epoch < args.warm:
+            lr = args.lr * (epoch + 1) / (args.warm + 1)
+        lr *= 0.5 * (1. + math.cos(math.pi * (epoch - args.warm) / (args.epochs - args.warm)))
     else:  # stepwise lr schedule
         for milestone in args.schedule:
             lr *= 0.1 if epoch >= milestone else 1.
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+
+def adjust_moco_momentum(epoch, args):
+    """Adjust moco momentum based on current epoch"""
+    m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / args.epochs)) * (1. - args.moco_m)
+    return m
 
 
 def accuracy(output, target, topk=(1,)):
