@@ -111,6 +111,8 @@ parser.add_argument('--warm', type=int, default=0)
 parser.add_argument('--smooth', type=float, default=0)
 parser.add_argument('--momen-cos', action='store_true')
 parser.add_argument('--strategy', type=int, default=1)
+parser.add_argument('--splits', type=str, default='0,2,8,20')
+parser.add_argument('--smooth_cos', action='store_true')
 
 
 def main():
@@ -298,7 +300,10 @@ def main_worker(gpu, ngpus_per_node, args):
             moco_m = adjust_moco_momentum(epoch, args)
             model.m = moco_m
         # train for one epoch
-        if epoch < args.warm:
+        if args.smooth_cos:
+            model.module.smooth = adjust_smooth(epoch, args)
+            print('smooth:', model.module.smooth)
+        elif epoch < args.warm:
             model.module.smooth = 0
         else:
             model.module.smooth = args.smooth

@@ -3,7 +3,6 @@ import math
 import torch.nn.functional as F
 
 
-
 def softmax_cross_entropy_with_softtarget(input, target, reduction='mean'):
     """
     :param input: (batch, *)
@@ -117,6 +116,12 @@ def adjust_learning_rate(optimizer, epoch, args):
 def adjust_moco_momentum(epoch, args):
     """Adjust moco momentum based on current epoch"""
     m = 1. - 0.5 * (1. + math.cos(math.pi * epoch / args.epochs)) * (1. - args.moco_m)
+    return m
+
+
+def adjust_smooth(epoch, args):
+    m = (1 - 0.5 * (1. + math.cos(math.pi * epoch / args.epochs))) * args.smooth
+
     return m
 
 
