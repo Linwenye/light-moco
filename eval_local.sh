@@ -14,7 +14,3 @@ for val in "${pathArray[@]}"; do
   --resume /apdcephfs/share_916081/liniuslin/Collapse/checkpoints/res18_moco_baseline_100epo_sym_lr0d12/checkpoint_0099.pth.tar \
   /apdcephfs/share_916081/liniuslin/Collapse/datasets/imagenet/ &
 done
-
-for (( i = 0; i < ; i++ )); do
-
-done

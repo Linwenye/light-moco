@@ -11,8 +11,9 @@ class MoCo(nn.Module):
     https://arxiv.org/abs/1911.05722
     """
 
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, symmetric=False, split_view=False, smooth=0, nn_pos=0,
-                 inner_dim=2048, strategy=1, zero_init=True):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, symmetric=False, split_view=False,
+                 smooth=0, nn_pos=0,
+                 inner_dim=2048, strategy=1, arch='resnet18'):
         """
         dim: feature dimension (default: 128)
         K: queue size; number of negative keys (default: 65536)
@@ -33,26 +34,24 @@ class MoCo(nn.Module):
         self.strategy = strategy
         # create the encoders
         # num_classes is the output fc dimension
-        if zero_init:
+        if arch.startswith('resnet'):
             self.encoder_q = base_encoder(num_classes=dim, zero_init_residual=True)
             self.encoder_k = base_encoder(num_classes=dim, zero_init_residual=True)
         else:
             self.encoder_q = base_encoder(num_classes=dim)
             self.encoder_k = base_encoder(num_classes=dim)
         if mlp:  # hack: brute-force replacement
-            dim_mlp = self.encoder_q.fc.weight.shape[1]
-            # self.encoder_q_fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), self.encoder_q.fc)
-            # self.encoder_k_fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), self.encoder_k.fc)
-            # self.encoder_q.fc = nn.Identity()
-            # self.encoder_k.fc = nn.Identity()
-            self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
-            self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
+            if arch.startswith('resnet'):
+                dim_mlp = self.encoder_q.fc.weight.shape[1]
+                self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
+                self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
+            else:
+                dim_mlp = self.encoder_q.classifier.weight.shape[1]
+                self.encoder_q.classifier = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
+                self.encoder_k.classifier = nn.Sequential(nn.Linear(dim_mlp, inner_dim), nn.ReLU(), nn.Linear(inner_dim, dim))
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
-        # for param_q, param_k in zip(self.encoder_q_fc.parameters(), self.encoder_k_fc.parameters()):
-        #     param_k.data.copy_(param_q.data)  # initialize
-        #     param_k.requires_grad = False  # not update by gradient
         # create the queue
         self.register_buffer("queue", torch.randn(dim, K))
         self.queue = nn.functional.normalize(self.queue, dim=0)
@@ -66,8 +65,6 @@ class MoCo(nn.Module):
         """
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
-        # for param_q, param_k in zip(self.encoder_q_fc.parameters(), self.encoder_k_fc.parameters()):
-        #     param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys):
@@ -184,9 +181,16 @@ class MoCo(nn.Module):
                 labels_prob[:, 0] = 1 - self.smooth
                 labels_prob.scatter_(1, t + 1, self.smooth / self.nn_pos)
             elif self.strategy == 2:
-                v, t = l_neg.topk(21)
+                v, t = l_neg.topk(self.nn_pos + 1)
                 labels_prob[:, 0] = 1 - self.smooth
-                splits = [0, 2, 8, 20]
+                if self.nn_pos == 10:
+                    splits = [0, 1, 4, 10]
+                elif self.nn_pos == 20:
+                    splits = [0, 2, 8, 20]
+                elif self.nn_pos == 5:
+                    splits = [0, 1, 3, 5]
+                elif self.nn_pos == 30:
+                    splits = [0, 3, 12, 30]
                 every_splits = [self.smooth / 2, self.smooth / 4, self.smooth / 4]
                 for i in range(1, 4):
                     item_smooth = every_splits[i - 1] / (splits[i] - splits[i - 1])
@@ -223,8 +227,9 @@ class MoCo(nn.Module):
         im_q_splits = self._local_split(im_q)
         im_q_splits = self.encoder_q(im_q_splits)
         im_q_splits = list(im_q_splits.split(im_q_splits.size(0) // 4, dim=0))  # 4b x c x
-        im_q_orthmix = torch.cat(list(map(lambda x: sum(x) / self.combs, list(combinations(im_q_splits, r=self.combs)))),
-                                 dim=0)  # 6 of 2combs / 4 of 3combs
+        im_q_orthmix = torch.cat(
+            list(map(lambda x: sum(x) / self.combs, list(combinations(im_q_splits, r=self.combs)))),
+            dim=0)  # 6 of 2combs / 4 of 3combs
         q = self.encoder_q_fc(im_q_orthmix)
         assert len(q.shape) == 2
         q = nn.functional.normalize(q, dim=1)

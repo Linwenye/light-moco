@@ -106,6 +106,12 @@ parser.add_argument('--aug-plus', action='store_true',
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
+# additional configs:
+parser.add_argument('--pretrained', default='', type=str,
+                    help='path to my_modules pretrained checkpoint')
+parser.add_argument('--moco', action='store_true')
+parser.add_argument('--msf', action='store_true')
+
 
 def main():
     args = parser.parse_args()
@@ -165,10 +171,74 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
-    # print(model)
+    # model = moco.builder.MoCo(
+    #     models.__dict__[args.arch],
+    #     args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
+    # # print(model)
+    # model = models.__dict__[args.arch]()
+    if args.arch == 'mobilenetv3':
+        print("=> MobileV3: creating model '{}'".format(args.arch))
+        base_model = mobilenetv3.mobilenetv3_large_100
+    elif args.arch in "efficientb0":
+        print("=> Effib0: creating model '{}'".format(args.arch))
+        base_model = efficientnet_b0
+    elif args.arch in "efficientb1":
+        print("=> Effib0: creating model '{}'".format(args.arch))
+        base_model = efficientnet_b1
+    else:
+        print("=> ELSE: creating model '{}'".format(args.arch))
+        base_model = models.__dict__[args.arch]
+    # load from pre-trained, before DistributedDataParallel constructor
+    model = base_model()
+
+    if args.pretrained:
+        if os.path.isfile(args.pretrained):
+            print("=> loading checkpoint '{}'".format(args.pretrained))
+            checkpoint = torch.load(args.pretrained, map_location="cpu")
+
+            # rename moco pre-trained keys
+            if args.msf:
+                if 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint['state_dict']
+                sd = state_dict
+                sd = {k.replace('module.', ''): v for k, v in sd.items()}
+                sd = {k: v for k, v in sd.items() if 'fc' not in k}
+                sd = {k: v for k, v in sd.items() if 'encoder_k' not in k}
+                sd = {k.replace('encoder_q.', ''): v for k, v in sd.items()}
+                state_dict = sd
+
+            else:
+                state_dict = checkpoint['state_dict']
+
+                for k in list(state_dict.keys()):
+                    # retain only encoder up to before the embedding layer
+                    if args.moco:
+                        if args.arch in ["efficientb0", "efficientb1", "mobilenetv3"]:
+                            if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.classifier'):
+                                # remove prefix
+                                state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+                        elif k.startswith('module.encoder_q.') and not k.startswith('module.encoder_q.fc'):
+                            # remove prefix
+                            state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+
+                    else:
+                        if k.startswith('module.encoder') and not k.startswith('module.encoder.fc'):
+                            # remove prefix
+                            state_dict[k[len("module.encoder."):]] = state_dict[k]
+                    # delete renamed or unused k
+                    del state_dict[k]
+
+            msg = model.load_state_dict(state_dict, strict=False)
+            if args.arch in ["efficientb0", "efficientb1", "mobilenetv3"]:
+                assert set(msg.missing_keys) == {"classifier.weight",
+                                                 "classifier.bias"}
+            else:
+                assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
+            print("=> loaded pre-trained my_modules '{}'".format(args.pretrained))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.pretrained))
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -188,40 +258,10 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
-    elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
-        # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
         raise NotImplementedError("Only DistributedDataParallel is supported.")
-
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
@@ -257,8 +297,13 @@ def main_worker(gpu, ngpus_per_node, args):
     print()
     print('train_loader')
     print('--------------------')
-    model.module.encoder_q.fc = nn.Identity()
-    kNN(model, train_loader, val_loader, 20, args.moco_t)
+    if args.arch in ['resnet18', 'resnet34']:
+        model.module.fc = nn.Identity()
+        dim = 512
+    elif args.arch in ['efficientb0', 'mobilenetv3', "efficientb1"]:
+        model.module.classifier = nn.Identity()
+        dim = 1280
+    kNN(model, train_loader, val_loader, 20, args.moco_t, dim)
     # eval_sim(train_loader, model, criterion, optimizer, args)
     dist.destroy_process_group()
 

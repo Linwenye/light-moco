@@ -2,15 +2,15 @@ import torch
 from moco.utils import *
 import time
 from tqdm import tqdm
+import torch.nn.functional as F
 
 
-def kNN(net, trainloader, testloader, K, sigma):
+def kNN(net, trainloader, testloader, K, sigma, dim=512):
     net.eval()
     net_time = AverageMeter('net_time')
     cls_time = AverageMeter('cls_time')
     total = 0
     testsize = testloader.dataset.__len__()
-    dim = 512
     trainFeatures = torch.empty(trainloader.dataset.__len__(), dim).t().cuda()
 
     transform_bak = trainloader.dataset.transform
@@ -21,7 +21,7 @@ def kNN(net, trainloader, testloader, K, sigma):
         for batch_idx, (inputs, targets) in tqdm(enumerate(trainloader), desc='loading features', total=len(trainloader)):
             labels.append(concat_all_gather(targets.cuda(non_blocking=True)))
             batchSize = 512
-            features = net(inputs)
+            features = F.normalize(net(inputs))
             features = concat_all_gather(features)
             assert features.size(0) == 512
             trainFeatures[:, batch_idx * batchSize:batch_idx * batchSize + batchSize] = features.data.t()
@@ -43,7 +43,7 @@ def kNN(net, trainloader, testloader, K, sigma):
             end = time.time()
             targets = targets.cuda(non_blocking=True)
             batchSize = inputs.size(0)
-            features = net(inputs)
+            features = F.normalize(net(inputs))
             net_time.update(time.time() - end)
             end = time.time()
 
@@ -74,6 +74,6 @@ def kNN(net, trainloader, testloader, K, sigma):
                   'Top1: {:.2f}  Top5: {:.2f}'.format(
                 total, testsize, top1 * 100. / total, top5 * 100. / total, net_time=net_time, cls_time=cls_time))
 
-    print(top1 * 100. / total)
+    print('final acc', top1 * 100. / total)
 
     return top1 / total

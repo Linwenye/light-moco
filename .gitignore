@@ -1,4 +1,4 @@
 .idea
 .github
-start.sh
-simple_config.json
+start*
+simple_config*

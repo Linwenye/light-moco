@@ -106,12 +106,11 @@ parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 parser.add_argument('--symmetric', action='store_true')
 parser.add_argument('--split-view', action='store_true')
-parser.add_argument('--nn-pos', type=int, default=0)
 parser.add_argument('--warm', type=int, default=0)
+parser.add_argument('--nn-pos', type=int, default=0)
 parser.add_argument('--smooth', type=float, default=0)
 parser.add_argument('--momen-cos', action='store_true')
 parser.add_argument('--strategy', type=int, default=1)
-parser.add_argument('--splits', type=str, default='0,2,8,20')
 parser.add_argument('--smooth_cos', action='store_true')
 
 
@@ -175,7 +174,6 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    zero_init = False
     if args.arch == 'mobilenetv3':
         print("=> MobileV3: creating model '{}'".format(args.arch))
         base_model = mobilenetv3.mobilenetv3_large_100
@@ -185,15 +183,13 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.arch in "efficientb1":
         print("=> Effib0: creating model '{}'".format(args.arch))
         base_model = efficientnet_b1
-
     else:
         print("=> ELSE: creating model '{}'".format(args.arch))
         base_model = models.__dict__[args.arch]
-        zero_init = True
     model = moco.builder.MoCo(
         base_model,
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp, args.symmetric, args.split_view, args.smooth, args.nn_pos,
-        strategy=args.strategy, zero_init=zero_init)
+        strategy=args.strategy, arch=args.arch)
     print(model)
     print(args)
     if args.distributed:
